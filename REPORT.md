@@ -1173,8 +1173,8 @@ erDiagram
     }
 
     repository_members {
-        VARCHAR team_id PK_FK "복합 PK, FK → teams"
-        VARCHAR user_id PK "복합 PK (논리적 FK → users)"
+        VARCHAR team_id PK "복합 PK, FK → teams"
+        VARCHAR user_id PK "복합 PK, 논리적 FK → users"
         ENUM role "ADMIN | MEMBER"
         TEXT encrypted_team_key "NOT NULL, 래핑된 팀 DEK"
     }
