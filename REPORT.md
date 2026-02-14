@@ -1144,3 +1144,557 @@ DB 쿼리는 IN 절로 최적화했지만, Feign 호출은 여전히 Task 업로
 | Auth | `/auth/**`, `/internal/**` | `AuthJwtAuthenticationFilter` (full User 로드) |
 | Team | `/internal/**`, `/edge-nodes/register` | `JwtAuthenticationFilter` (Common, userId String) |
 | Core | `/api/security/**`, `/api/sync/tasks`, `/internal/**` | `JwtAuthenticationFilter` (Common, userId String) |
+
+---
+
+## 14. ERD (Entity-Relationship Diagram)
+
+3개의 논리적 데이터베이스에 걸친 전체 테이블 구조입니다. MSA 특성상 서비스 간 FK 참조는 없으며, `userId`/`teamId` 등의 String 필드로 논리적으로 연결됩니다.
+
+```mermaid
+erDiagram
+    %% ========== serve_auth_db ==========
+    users {
+        VARCHAR user_id PK "UUID"
+        VARCHAR email UK "UNIQUE"
+        VARCHAR hashed_password "NOT NULL"
+        TEXT public_key "NOT NULL, ECIES 공개키"
+        TEXT encrypted_private_key "NOT NULL, 암호화된 개인키"
+    }
+
+    %% ========== serve_team_db ==========
+    teams {
+        VARCHAR team_id PK "UUID"
+        VARCHAR name "NOT NULL"
+        VARCHAR description "MAX 1000"
+        VARCHAR owner_id "사용자 UUID (논리적 FK → users)"
+        DATETIME created_at ""
+        ENUM type "TEAM"
+    }
+
+    repository_members {
+        VARCHAR team_id PK_FK "복합 PK, FK → teams"
+        VARCHAR user_id PK "복합 PK (논리적 FK → users)"
+        ENUM role "ADMIN | MEMBER"
+        TEXT encrypted_team_key "NOT NULL, 래핑된 팀 DEK"
+    }
+
+    edge_nodes {
+        VARCHAR node_id PK "UUID"
+        VARCHAR serial_number UK "UNIQUE"
+        VARCHAR hashed_token "NOT NULL"
+        TEXT public_key "NOT NULL"
+        TEXT encrypted_team_key "래핑된 팀 DEK"
+        VARCHAR team_id FK "FK → teams"
+    }
+
+    teams ||--o{ repository_members : "has members"
+    teams ||--o{ edge_nodes : "has edge nodes"
+
+    %% ========== serve_core_db ==========
+    tasks {
+        BIGINT id PK "AUTO_INCREMENT"
+        VARCHAR task_id UK "UUID, UNIQUE"
+        VARCHAR team_id "논리적 FK → teams"
+        VARCHAR uploader_id "논리적 FK → users"
+        VARCHAR original_file_name ""
+        VARCHAR file_type ""
+        DATETIME uploaded_at ""
+    }
+
+    encrypted_data {
+        VARCHAR data_id PK "UUID"
+        BIGINT task_id FK "FK → tasks.id"
+        LONGBLOB encrypted_blob "NOT NULL, 암호화 데이터"
+        INT version "낙관적 잠금"
+    }
+
+    vector_demos {
+        VARCHAR demo_id PK "UUID (36)"
+        VARCHAR task_id "논리적 FK → tasks.task_id"
+        VARCHAR team_id "논리적 FK → teams"
+        INT demo_index "NOT NULL"
+        LONGBLOB encrypted_blob "NOT NULL, 암호화 벡터"
+        INT version "낙관적 잠금, @Version"
+        BOOLEAN is_deleted "논리적 삭제 플래그"
+        DATETIME created_at ""
+        DATETIME updated_at ""
+    }
+
+    tasks ||--o| encrypted_data : "1:1 암호화 데이터"
+    tasks ||--o{ vector_demos : "1:N 벡터 데모 (task_id)"
+```
+
+### DB별 테이블 요약
+
+| 데이터베이스 | 테이블 | 설명 |
+|-------------|--------|------|
+| `serve_auth_db` | `users` | 사용자 계정 (인증정보 + 공개키/암호화된 개인키) |
+| `serve_team_db` | `teams` | 팀(저장소) 메타데이터 |
+| `serve_team_db` | `repository_members` | 팀-사용자 매핑 (복합 PK, 역할 + 래핑된 팀키) |
+| `serve_team_db` | `edge_nodes` | 로봇(엣지노드) 등록 정보 |
+| `serve_core_db` | `tasks` | 태스크 메타데이터 (파일명, 업로더, 팀) |
+| `serve_core_db` | `encrypted_data` | 태스크의 암호화된 바이너리 데이터 (1:1) |
+| `serve_core_db` | `vector_demos` | 벡터 임베딩 데모 데이터 (버전 관리 + 논리적 삭제) |
+
+---
+
+## 15. 클래스 다이어그램 (Class Diagram)
+
+서비스 계층 중심의 클래스 관계도입니다. 각 MSA 모듈별 Controller → Service → Repository → Entity 구조와 Feign Client를 통한 서비스 간 의존관계를 보여줍니다.
+
+```mermaid
+classDiagram
+    direction TB
+
+    %% ========== SeRVe-Auth ==========
+    namespace Auth_Service_8081 {
+        class AuthController {
+            +register(RegisterRequest) ResponseEntity
+            +login(LoginRequest) ResponseEntity
+            +resetPassword(ResetPasswordRequest) ResponseEntity
+        }
+        class AuthService {
+            -UserRepository userRepository
+            -JwtTokenProvider jwtTokenProvider
+            +register(RegisterRequest) void
+            +login(LoginRequest) LoginResponse
+            +resetPassword(ResetPasswordRequest) void
+        }
+        class UserRepository {
+            <<interface>>
+            +findByEmail(String) Optional~User~
+            +findByUserId(String) Optional~User~
+        }
+        class User {
+            -String userId
+            -String email
+            -String hashedPassword
+            -String publicKey
+            -String encryptedPrivateKey
+        }
+        class AuthInternalController {
+            +getUserInfo(String) UserInfoResponse
+            +getUserByEmail(String) UserInfoResponse
+            +userExists(String) boolean
+        }
+    }
+
+    AuthController --> AuthService
+    AuthService --> UserRepository
+    UserRepository --> User
+    AuthInternalController --> AuthService
+
+    %% ========== SeRVe-Team ==========
+    namespace Team_Service_8082 {
+        class RepoController {
+            +createRepository(CreateRepoRequest) ResponseEntity
+            +getRepositories() ResponseEntity
+            +deleteRepository(String) ResponseEntity
+        }
+        class MemberController {
+            +inviteMember(String, InviteMemberRequest) ResponseEntity
+            +getMembers(String) ResponseEntity
+            +kickMember(String, String) ResponseEntity
+        }
+        class RepoService {
+            -TeamRepository teamRepository
+            -MemberRepository memberRepository
+            -AuthServiceClient authServiceClient
+            +createRepository(String, String, String, String) String
+            +getMyRepos(String) List~RepoResponse~
+            +deleteRepo(String, String) void
+        }
+        class MemberService {
+            -MemberRepository memberRepository
+            -TeamRepository teamRepository
+            -AuthServiceClient authServiceClient
+            +inviteMember(String, String, InviteMemberRequest) void
+            +getMembers(String, String) List~MemberResponse~
+            +kickMember(String, String, String) MemberKickResponse
+        }
+        class TeamRepository {
+            <<interface>>
+            +findByTeamId(String) Optional~Team~
+            +findByName(String) Optional~Team~
+        }
+        class MemberRepository {
+            <<interface>>
+            +findByTeamAndUserId(Team, String) Optional~RepositoryMember~
+            +findAllByTeam(Team) List~RepositoryMember~
+            +existsByTeamAndUserId(Team, String) boolean
+        }
+        class Team {
+            -String teamId
+            -String name
+            -String description
+            -String ownerId
+        }
+        class RepositoryMember {
+            -RepositoryMemberId id
+            -Team team
+            -Role role
+            -String encryptedTeamKey
+        }
+        class Team_AuthServiceClient {
+            <<FeignClient>>
+            +getUserInfo(String) UserInfoResponse
+            +getUserByEmail(String) UserInfoResponse
+        }
+        class TeamInternalController {
+            +teamExists(String) boolean
+            +memberExists(String, String) boolean
+            +getMemberRole(String, String) MemberRoleResponse
+        }
+    }
+
+    RepoController --> RepoService
+    MemberController --> MemberService
+    RepoService --> TeamRepository
+    RepoService --> MemberRepository
+    RepoService --> Team_AuthServiceClient
+    MemberService --> TeamRepository
+    MemberService --> MemberRepository
+    MemberService --> Team_AuthServiceClient
+    TeamRepository --> Team
+    MemberRepository --> RepositoryMember
+    RepositoryMember --> Team
+    TeamInternalController --> RepoService
+    TeamInternalController --> MemberService
+
+    %% ========== SeRVe-Core ==========
+    namespace Core_Service_8083 {
+        class TaskController {
+            +uploadTask(String, UploadTaskRequest) ResponseEntity
+            +getTasks(String) ResponseEntity
+            +getDataById(Long) ResponseEntity
+            +deleteTask(String, String) ResponseEntity
+        }
+        class DemoController {
+            +uploadDemos(String, DemoUploadRequest) ResponseEntity
+            +deleteDemo(String, int, String) ResponseEntity
+            +syncTeamDemos(String, int) ResponseEntity
+        }
+        class SyncController {
+            +getChangedTasks(String, String) ResponseEntity
+        }
+        class TaskService {
+            -TaskRepository taskRepository
+            -EncryptedDataRepository encDataRepo
+            -TeamServiceClient teamServiceClient
+            -AuthServiceClient authServiceClient
+            +uploadTask(String, String, UploadTaskRequest) Long
+            +getTasks(String, String) List~TaskResponse~
+            +getDataById(Long, String) EncryptedDataResponse
+            +deleteTask(String, String, String) void
+        }
+        class DemoService {
+            -VectorDemoRepository vectorDemoRepository
+            -TaskRepository taskRepository
+            -TeamServiceClient teamServiceClient
+            -RateLimitService rateLimitService
+            +uploadDemos(String, String, String, DemoUploadRequest) void
+            +deleteDemo(String, String, int, String) void
+            +syncTeamDemos(String, int, String) List~DemoSyncResponse~
+        }
+        class SyncService {
+            -TaskRepository taskRepository
+            +getChangedTasks(String, String) List~ChangedTaskResponse~
+        }
+        class TaskRepository {
+            <<interface>>
+            +findByTaskId(String) Optional~Task~
+            +findAllByTeamId(String) List~Task~
+            +findAllByTaskIdIn(List) List~Task~
+        }
+        class VectorDemoRepository {
+            <<interface>>
+            +findByTaskIdAndDemoIndex(String, int) Optional~VectorDemo~
+            +findByTeamIdAndVersionGreaterThanOrderByVersionAsc(String, int) List~VectorDemo~
+        }
+        class EncryptedDataRepository {
+            <<interface>>
+            +findByTask(Task) Optional~EncryptedData~
+        }
+        class Task {
+            -Long id
+            -String taskId
+            -String teamId
+            -String uploaderId
+            -String originalFileName
+        }
+        class EncryptedData {
+            -String dataId
+            -Task task
+            -byte[] encryptedBlob
+            -int version
+        }
+        class VectorDemo {
+            -String demoId
+            -String taskId
+            -String teamId
+            -int demoIndex
+            -byte[] encryptedBlob
+        }
+        class Core_TeamServiceClient {
+            <<FeignClient>>
+            +teamExists(String) boolean
+            +memberExists(String, String) boolean
+            +getMemberRole(String, String) MemberRoleResponse
+        }
+        class Core_AuthServiceClient {
+            <<FeignClient>>
+            +getUserInfo(String) UserInfoResponse
+            +userExists(String) boolean
+        }
+    }
+
+    TaskController --> TaskService
+    DemoController --> DemoService
+    SyncController --> SyncService
+    TaskService --> TaskRepository
+    TaskService --> EncryptedDataRepository
+    TaskService --> Core_TeamServiceClient
+    TaskService --> Core_AuthServiceClient
+    DemoService --> VectorDemoRepository
+    DemoService --> TaskRepository
+    DemoService --> Core_TeamServiceClient
+    SyncService --> TaskRepository
+    TaskRepository --> Task
+    EncryptedDataRepository --> EncryptedData
+    VectorDemoRepository --> VectorDemo
+    EncryptedData --> Task
+
+    %% ========== Feign 연결 (서비스 간 통신) ==========
+    Team_AuthServiceClient ..> AuthInternalController : "Feign HTTP"
+    Core_TeamServiceClient ..> TeamInternalController : "Feign HTTP"
+    Core_AuthServiceClient ..> AuthInternalController : "Feign HTTP"
+```
+
+---
+
+## 16. 시퀀스 다이어그램 (Sequence Diagrams)
+
+### 16.1 데모 데이터 업로드
+
+클라이언트가 벡터 임베딩 데모 데이터를 업로드하는 전체 흐름입니다. MEMBER 역할만 업로드 가능하며, Rate Limit 체크 후 Task를 찾거나 생성하고, 각 데모를 UPSERT 처리합니다.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    actor Client
+    participant Nginx as Nginx Gateway<br/>:8080
+    participant DC as DemoController<br/>(Core :8083)
+    participant DS as DemoService
+    participant RLS as RateLimitService
+    participant TSC as TeamServiceClient<br/>(Feign)
+    participant Team as Team Service<br/>:8082
+    participant TR as TaskRepository
+    participant VDR as VectorDemoRepository
+    participant DB as serve_core_db
+
+    Client->>Nginx: POST /api/teams/{teamId}/demos<br/>[JWT + DemoUploadRequest]
+    Nginx->>DC: 라우팅 (프록시)
+    DC->>DC: JWT에서 userId 추출<br/>authentication.getPrincipal()
+    DC->>DS: uploadDemos(teamId, fileName, userId, request)
+
+    %% 1. 팀 존재 확인 (Feign)
+    DS->>TSC: teamExists(teamId)
+    TSC->>Team: GET /internal/teams/{teamId}/exists
+    Team-->>TSC: true
+    TSC-->>DS: true
+
+    %% 1-1. Rate Limit 체크
+    DS->>RLS: checkAndRecordUpload(userId)
+    RLS-->>DS: OK (제한 미초과)
+
+    %% 2. 멤버십 및 권한 체크 (Feign)
+    DS->>TSC: getMemberRole(teamId, userId)
+    TSC->>Team: GET /internal/teams/{teamId}/members/{userId}/role
+    Team-->>TSC: MemberRoleResponse {role: "MEMBER"}
+    TSC-->>DS: MemberRoleResponse
+
+    Note over DS: ADMIN이면 업로드 거부<br/>MEMBER만 업로드 가능
+
+    %% 3. Task 찾거나 생성
+    DS->>TR: findByTeamIdAndOriginalFileName(teamId, fileName)
+    TR->>DB: SELECT * FROM tasks WHERE ...
+    DB-->>TR: Optional<Task>
+
+    alt Task 없는 경우 (신규)
+        DS->>TR: save(new Task)
+        TR->>DB: INSERT INTO tasks
+        DB-->>TR: Task (id 자동 생성)
+    else Task 있는 경우
+        Note over DS: uploaderId 검증<br/>(타인의 태스크 수정 방지)
+    end
+
+    %% 4. 각 데모 UPSERT
+    loop 각 DemoUploadItem
+        DS->>DS: Base64 디코딩 (encryptedBlob)
+        DS->>VDR: findByTaskIdAndDemoIndex(taskId, demoIndex)
+        VDR->>DB: SELECT * FROM vector_demos WHERE ...
+        DB-->>VDR: Optional<VectorDemo>
+
+        alt 기존 데모 있음 (UPDATE)
+            DS->>DS: demo.updateContent(blobData)<br/>demo.setDeleted(false)
+            Note over DS: @Version에 의해 version 자동 증가
+        else 신규 데모 (INSERT)
+            DS->>VDR: save(new VectorDemo)
+            VDR->>DB: INSERT INTO vector_demos
+        end
+    end
+
+    DS-->>DC: void (정상 완료)
+    DC-->>Nginx: 200 OK
+    Nginx-->>Client: 200 OK
+```
+
+### 16.2 데모 데이터 삭제
+
+ADMIN 권한을 가진 사용자만 데모 데이터를 삭제(논리적 삭제)할 수 있습니다. `is_deleted` 플래그를 true로 설정하고 `version`을 자동 증가시켜 동기화 시 삭제 이벤트가 전파됩니다.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    actor Client
+    participant Nginx as Nginx Gateway<br/>:8080
+    participant DC as DemoController<br/>(Core :8083)
+    participant DS as DemoService
+    participant TSC as TeamServiceClient<br/>(Feign)
+    participant Team as Team Service<br/>:8082
+    participant TR as TaskRepository
+    participant VDR as VectorDemoRepository
+    participant DB as serve_core_db
+
+    Client->>Nginx: DELETE /api/teams/{teamId}/demos/{demoIndex}<br/>?fileName=xxx [JWT]
+    Nginx->>DC: 라우팅 (프록시)
+    DC->>DC: JWT에서 userId 추출
+    DC->>DS: deleteDemo(teamId, fileName, demoIndex, userId)
+
+    %% 1. 팀 존재 확인 (Feign)
+    DS->>TSC: teamExists(teamId)
+    TSC->>Team: GET /internal/teams/{teamId}/exists
+    Team-->>TSC: true
+    TSC-->>DS: true
+
+    %% 2. ADMIN 권한 체크 (Feign)
+    DS->>TSC: getMemberRole(teamId, userId)
+    TSC->>Team: GET /internal/teams/{teamId}/members/{userId}/role
+    Team-->>TSC: MemberRoleResponse {role: "ADMIN"}
+    TSC-->>DS: MemberRoleResponse
+
+    Note over DS: ADMIN이 아니면<br/>SecurityException 발생
+
+    %% 3. Task 조회
+    DS->>TR: findByTeamIdAndOriginalFileName(teamId, fileName)
+    TR->>DB: SELECT * FROM tasks WHERE team_id=? AND original_file_name=?
+    DB-->>TR: Task
+
+    %% 4. 데모 조회 및 논리적 삭제
+    DS->>VDR: findByTaskIdAndDemoIndex(taskId, demoIndex)
+    VDR->>DB: SELECT * FROM vector_demos WHERE task_id=? AND demo_index=?
+    DB-->>VDR: VectorDemo
+
+    DS->>DS: demo.markAsDeleted()
+    Note over DS: isDeleted = true<br/>@Version → version 자동 증가
+
+    Note over DB: @Transactional 커밋 시<br/>UPDATE vector_demos SET<br/>is_deleted=true, version=version+1
+
+    DS-->>DC: void (정상 완료)
+    DC-->>Nginx: 200 OK
+    Nginx-->>Client: 200 OK
+```
+
+### 16.3 팀 저장소 생성 및 멤버 초대
+
+두 단계로 구성됩니다: (1) 저장소 생성 시 Owner가 ADMIN으로 자동 등록, (2) ADMIN이 이메일로 새 멤버를 초대. 멤버 초대 시 Auth 서비스에 Feign 호출하여 이메일로 사용자를 조회합니다.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    actor Owner as Owner (ADMIN)
+    participant Nginx as Nginx Gateway<br/>:8080
+    participant RC as RepoController<br/>(Team :8082)
+    participant RS as RepoService
+    participant MC as MemberController<br/>(Team :8082)
+    participant MS as MemberService
+    participant TR as TeamRepository
+    participant MR as MemberRepository
+    participant ASC as AuthServiceClient<br/>(Feign)
+    participant Auth as Auth Service<br/>:8081
+    participant DB as serve_team_db
+
+    %% ===== Part 1: 저장소 생성 =====
+    rect rgb(230, 245, 255)
+        Note over Owner, DB: Part 1: 저장소 생성
+
+        Owner->>Nginx: POST /api/repositories<br/>[JWT + CreateRepoRequest]
+        Nginx->>RC: 라우팅 (프록시)
+        RC->>RC: JWT에서 userId 추출
+        RC->>RS: createRepository(name, description, userId, encryptedTeamKey)
+
+        %% 이름 중복 체크
+        RS->>TR: findByName(name)
+        TR->>DB: SELECT * FROM teams WHERE name=?
+        DB-->>TR: Optional.empty()
+
+        %% 팀 생성
+        RS->>TR: save(new Team)
+        TR->>DB: INSERT INTO teams (team_id, name, description, owner_id, ...)
+        DB-->>TR: Team (UUID 생성됨)
+
+        %% Owner를 ADMIN 멤버로 등록
+        RS->>MR: save(new RepositoryMember)
+        Note over RS: role = ADMIN<br/>encryptedTeamKey = 클라이언트가 전달한 래핑된 DEK
+        MR->>DB: INSERT INTO repository_members (team_id, user_id, role, encrypted_team_key)
+        DB-->>MR: RepositoryMember
+
+        RS-->>RC: teamId (생성된 UUID)
+        RC-->>Nginx: 200 OK {"id": "team-uuid"}
+        Nginx-->>Owner: 200 OK {"id": "team-uuid"}
+    end
+
+    %% ===== Part 2: 멤버 초대 =====
+    rect rgb(255, 245, 230)
+        Note over Owner, DB: Part 2: 멤버 초대 (ADMIN 전용)
+
+        Owner->>Nginx: POST /api/teams/{teamId}/members<br/>[JWT + InviteMemberRequest {email, encryptedTeamKey}]
+        Nginx->>MC: 라우팅 (프록시)
+        MC->>MC: JWT에서 userId 추출
+        MC->>MS: inviteMember(teamId, inviterUserId, request)
+
+        %% 팀 조회
+        MS->>TR: findByTeamId(teamId)
+        TR->>DB: SELECT * FROM teams WHERE team_id=?
+        DB-->>TR: Team
+
+        %% 초대자 권한 검증
+        MS->>MR: findByTeamAndUserId(team, inviterUserId)
+        MR->>DB: SELECT * FROM repository_members WHERE team_id=? AND user_id=?
+        DB-->>MR: RepositoryMember {role: ADMIN}
+
+        Note over MS: ADMIN이 아니면<br/>SecurityException 발생
+
+        %% 피초대자 정보 조회 (Feign → Auth)
+        MS->>ASC: getUserByEmail(email)
+        ASC->>Auth: GET /internal/users/by-email?email=xxx
+        Auth-->>ASC: UserInfoResponse {userId, email, publicKey}
+        ASC-->>MS: UserInfoResponse
+
+        %% 중복 멤버 체크
+        MS->>MR: existsByTeamAndUserId(team, inviteeUserId)
+        MR->>DB: SELECT COUNT(*) FROM repository_members WHERE ...
+        DB-->>MR: false (중복 아님)
+
+        %% 멤버 추가
+        MS->>MR: save(new RepositoryMember)
+        Note over MS: role = MEMBER<br/>encryptedTeamKey = ADMIN이 피초대자 공개키로 래핑한 DEK
+        MR->>DB: INSERT INTO repository_members (team_id, user_id, role, encrypted_team_key)
+        DB-->>MR: RepositoryMember
+
+        MS-->>MC: void (정상 완료)
+        MC-->>Nginx: 200 OK
+        Nginx-->>Owner: 200 OK
+    end
+```
