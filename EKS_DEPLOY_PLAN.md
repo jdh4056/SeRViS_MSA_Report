@@ -1181,3 +1181,715 @@ flowchart LR
     Kubectl --> EKS_CP
     EKS_CP --> EKS
 ```
+
+---
+
+## 15. 대안: Terraform을 활용한 IaC(Infrastructure as Code) 구축
+
+앞선 섹션 1~14에서는 AWS 콘솔 또는 CLI를 통한 수동 프로비저닝을 전제로 설명했습니다.
+이 섹션에서는 동일한 인프라를 **Terraform으로 코드화**하여 관리하는 대안을 제시합니다.
+
+### 15.1 왜 Terraform인가
+
+| 수동 프로비저닝 (섹션 11) | Terraform IaC |
+|---|---|
+| AWS 콘솔에서 VPC, EKS, RDS 등을 하나씩 생성 | `terraform apply` 한 번으로 전체 인프라 생성 |
+| 설정 변경 시 콘솔에서 직접 수정 | `.tf` 파일 수정 → `terraform plan` → `terraform apply` |
+| 환경 재현 어려움 (수작업 반복) | 동일 코드로 dev/staging/prod 환경 복제 가능 |
+| 인프라 상태 추적 불가 | `terraform.tfstate`로 현재 상태 추적 |
+| 삭제 시 리소스 누락 위험 | `terraform destroy`로 전체 정리 |
+
+### 15.2 Terraform 프로젝트 구조
+
+```
+terraform/
+├── main.tf                 # Provider 설정, Terraform backend
+├── variables.tf            # 입력 변수 정의
+├── outputs.tf              # 출력값 (RDS endpoint, ECR URI, EKS 정보)
+├── terraform.tfvars        # 실제 값 (⚠️ Git에 커밋 금지)
+│
+├── vpc.tf                  # VPC, 서브넷, NAT GW, IGW, 라우팅 테이블
+├── security-groups.tf      # ALB / EKS Node / RDS 보안 그룹
+├── ecr.tf                  # ECR 리포지토리 3개
+├── rds.tf                  # RDS MariaDB 인스턴스 + 서브넷 그룹
+├── eks.tf                  # EKS 클러스터 + 노드 그룹
+├── iam.tf                  # EKS / 노드 / LB Controller IAM 역할
+│
+└── .gitignore              # terraform.tfvars, *.tfstate 제외
+```
+
+### 15.3 Provider 및 Backend 설정
+
+```hcl
+# main.tf
+terraform {
+  required_version = ">= 1.5.0"
+
+  required_providers {
+    aws = {
+      source  = "hashicorp/aws"
+      version = "~> 5.0"
+    }
+  }
+
+  # (선택) S3 원격 Backend — 팀 협업 시 상태 파일 공유용
+  # backend "s3" {
+  #   bucket         = "serve-terraform-state"
+  #   key            = "eks/terraform.tfstate"
+  #   region         = "ap-northeast-2"
+  #   dynamodb_table = "serve-terraform-lock"
+  #   encrypt        = true
+  # }
+}
+
+provider "aws" {
+  region = var.aws_region
+}
+```
+
+### 15.4 변수 정의
+
+```hcl
+# variables.tf
+variable "aws_region" {
+  description = "AWS 리전"
+  type        = string
+  default     = "ap-northeast-2"
+}
+
+variable "project_name" {
+  description = "프로젝트 이름 (리소스 네이밍에 사용)"
+  type        = string
+  default     = "serve"
+}
+
+variable "vpc_cidr" {
+  description = "VPC CIDR 블록"
+  type        = string
+  default     = "10.0.0.0/16"
+}
+
+variable "db_username" {
+  description = "RDS 마스터 사용자"
+  type        = string
+  sensitive   = true
+}
+
+variable "db_password" {
+  description = "RDS 마스터 비밀번호"
+  type        = string
+  sensitive   = true
+}
+
+variable "db_app_username" {
+  description = "애플리케이션 DB 사용자"
+  type        = string
+  default     = "serve_user"
+}
+
+variable "db_app_password" {
+  description = "애플리케이션 DB 비밀번호"
+  type        = string
+  sensitive   = true
+}
+
+variable "jwt_secret" {
+  description = "JWT 시크릿 키"
+  type        = string
+  sensitive   = true
+}
+
+variable "eks_node_instance_type" {
+  description = "EKS 워커 노드 인스턴스 타입"
+  type        = string
+  default     = "t3.medium"
+}
+
+variable "eks_node_desired" {
+  description = "EKS 워커 노드 희망 수"
+  type        = number
+  default     = 2
+}
+```
+
+```hcl
+# terraform.tfvars (⚠️ Git에 커밋 금지)
+db_username    = "admin"
+db_password    = "CHANGE_ME_RDS_MASTER_PW"
+db_app_password = "serve_pass"
+jwt_secret     = "404E635266556A586E3272357538782F413F4428472B4B6250645367566B5970"
+```
+
+### 15.5 VPC 및 네트워크
+
+```hcl
+# vpc.tf
+
+# AZ 목록 조회
+data "aws_availability_zones" "available" {
+  state = "available"
+}
+
+# VPC
+resource "aws_vpc" "main" {
+  cidr_block           = var.vpc_cidr
+  enable_dns_hostnames = true
+  enable_dns_support   = true
+
+  tags = { Name = "${var.project_name}-vpc" }
+}
+
+# Public 서브넷 (ALB용, 2개 AZ)
+resource "aws_subnet" "public" {
+  count                   = 2
+  vpc_id                  = aws_vpc.main.id
+  cidr_block              = cidrsubnet(var.vpc_cidr, 8, count.index + 1)   # 10.0.1.0/24, 10.0.2.0/24
+  availability_zone       = data.aws_availability_zones.available.names[count.index]
+  map_public_ip_on_launch = true
+
+  tags = {
+    Name                                          = "${var.project_name}-public-${count.index}"
+    "kubernetes.io/role/elb"                      = "1"
+    "kubernetes.io/cluster/${var.project_name}-eks" = "shared"
+  }
+}
+
+# Private 서브넷 (EKS + RDS용, 2개 AZ)
+resource "aws_subnet" "private" {
+  count             = 2
+  vpc_id            = aws_vpc.main.id
+  cidr_block        = cidrsubnet(var.vpc_cidr, 8, count.index + 10)  # 10.0.10.0/24, 10.0.11.0/24
+  availability_zone = data.aws_availability_zones.available.names[count.index]
+
+  tags = {
+    Name                                          = "${var.project_name}-private-${count.index}"
+    "kubernetes.io/role/internal-elb"             = "1"
+    "kubernetes.io/cluster/${var.project_name}-eks" = "shared"
+  }
+}
+
+# Internet Gateway
+resource "aws_internet_gateway" "main" {
+  vpc_id = aws_vpc.main.id
+  tags   = { Name = "${var.project_name}-igw" }
+}
+
+# NAT Gateway (Private → 외부 통신용)
+resource "aws_eip" "nat" {
+  domain = "vpc"
+  tags   = { Name = "${var.project_name}-nat-eip" }
+}
+
+resource "aws_nat_gateway" "main" {
+  allocation_id = aws_eip.nat.id
+  subnet_id     = aws_subnet.public[0].id
+  tags          = { Name = "${var.project_name}-nat" }
+
+  depends_on = [aws_internet_gateway.main]
+}
+
+# Public 라우팅 테이블
+resource "aws_route_table" "public" {
+  vpc_id = aws_vpc.main.id
+  route {
+    cidr_block = "0.0.0.0/0"
+    gateway_id = aws_internet_gateway.main.id
+  }
+  tags = { Name = "${var.project_name}-public-rt" }
+}
+
+resource "aws_route_table_association" "public" {
+  count          = 2
+  subnet_id      = aws_subnet.public[count.index].id
+  route_table_id = aws_route_table.public.id
+}
+
+# Private 라우팅 테이블
+resource "aws_route_table" "private" {
+  vpc_id = aws_vpc.main.id
+  route {
+    cidr_block     = "0.0.0.0/0"
+    nat_gateway_id = aws_nat_gateway.main.id
+  }
+  tags = { Name = "${var.project_name}-private-rt" }
+}
+
+resource "aws_route_table_association" "private" {
+  count          = 2
+  subnet_id      = aws_subnet.private[count.index].id
+  route_table_id = aws_route_table.private.id
+}
+```
+
+### 15.6 보안 그룹
+
+```hcl
+# security-groups.tf
+
+# ALB 보안 그룹
+resource "aws_security_group" "alb" {
+  name_prefix = "${var.project_name}-alb-"
+  vpc_id      = aws_vpc.main.id
+
+  ingress {
+    from_port   = 80
+    to_port     = 80
+    protocol    = "tcp"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+
+  ingress {
+    from_port   = 443
+    to_port     = 443
+    protocol    = "tcp"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+
+  egress {
+    from_port   = 0
+    to_port     = 0
+    protocol    = "-1"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+
+  tags = { Name = "${var.project_name}-alb-sg" }
+}
+
+# EKS 노드 보안 그룹
+resource "aws_security_group" "eks_node" {
+  name_prefix = "${var.project_name}-eks-node-"
+  vpc_id      = aws_vpc.main.id
+
+  # ALB → Pod 트래픽
+  ingress {
+    from_port       = 8081
+    to_port         = 8083
+    protocol        = "tcp"
+    security_groups = [aws_security_group.alb.id]
+  }
+
+  # Pod 간 통신
+  ingress {
+    from_port = 0
+    to_port   = 0
+    protocol  = "-1"
+    self      = true
+  }
+
+  egress {
+    from_port   = 0
+    to_port     = 0
+    protocol    = "-1"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+
+  tags = { Name = "${var.project_name}-eks-node-sg" }
+}
+
+# RDS 보안 그룹
+resource "aws_security_group" "rds" {
+  name_prefix = "${var.project_name}-rds-"
+  vpc_id      = aws_vpc.main.id
+
+  # EKS 노드에서만 접근 허용
+  ingress {
+    from_port       = 3306
+    to_port         = 3306
+    protocol        = "tcp"
+    security_groups = [aws_security_group.eks_node.id]
+  }
+
+  egress {
+    from_port   = 0
+    to_port     = 0
+    protocol    = "-1"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+
+  tags = { Name = "${var.project_name}-rds-sg" }
+}
+```
+
+### 15.7 ECR 리포지토리
+
+```hcl
+# ecr.tf
+locals {
+  services = ["auth", "team", "core"]
+}
+
+resource "aws_ecr_repository" "services" {
+  for_each             = toset(local.services)
+  name                 = "${var.project_name}-${each.key}"
+  image_tag_mutability = "MUTABLE"
+  force_delete         = true
+
+  image_scanning_configuration {
+    scan_on_push = true
+  }
+
+  tags = { Name = "${var.project_name}-${each.key}" }
+}
+
+# 오래된 이미지 자동 정리 (최근 10개만 유지)
+resource "aws_ecr_lifecycle_policy" "cleanup" {
+  for_each   = toset(local.services)
+  repository = aws_ecr_repository.services[each.key].name
+
+  policy = jsonencode({
+    rules = [{
+      rulePriority = 1
+      description  = "Keep last 10 images"
+      selection = {
+        tagStatus   = "any"
+        countType   = "imageCountMoreThan"
+        countNumber = 10
+      }
+      action = { type = "expire" }
+    }]
+  })
+}
+```
+
+### 15.8 RDS MariaDB
+
+```hcl
+# rds.tf
+
+resource "aws_db_subnet_group" "main" {
+  name       = "${var.project_name}-db-subnet"
+  subnet_ids = aws_subnet.private[*].id
+  tags       = { Name = "${var.project_name}-db-subnet" }
+}
+
+resource "aws_db_instance" "mariadb" {
+  identifier     = "${var.project_name}-mariadb"
+  engine         = "mariadb"
+  engine_version = "11.4"
+  instance_class = "db.t3.micro"
+
+  allocated_storage     = 20
+  max_allocated_storage = 50
+  storage_type          = "gp3"
+
+  db_name  = "serve_auth_db"    # 초기 DB (나머지 2개는 수동 생성)
+  username = var.db_username
+  password = var.db_password
+
+  db_subnet_group_name   = aws_db_subnet_group.main.name
+  vpc_security_group_ids = [aws_security_group.rds.id]
+
+  multi_az            = false    # 개발: false / 운영: true
+  publicly_accessible = false
+  skip_final_snapshot = true     # 개발 환경용
+
+  parameter_group_name = aws_db_parameter_group.mariadb.name
+
+  tags = { Name = "${var.project_name}-mariadb" }
+}
+
+resource "aws_db_parameter_group" "mariadb" {
+  name_prefix = "${var.project_name}-mariadb-"
+  family      = "mariadb11.4"
+
+  parameter {
+    name  = "character_set_server"
+    value = "utf8mb4"
+  }
+
+  parameter {
+    name  = "collation_server"
+    value = "utf8mb4_unicode_ci"
+  }
+
+  tags = { Name = "${var.project_name}-mariadb-params" }
+}
+```
+
+### 15.9 EKS 클러스터
+
+```hcl
+# iam.tf
+
+# EKS 클러스터 IAM 역할
+resource "aws_iam_role" "eks_cluster" {
+  name = "${var.project_name}-eks-cluster-role"
+
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Action = "sts:AssumeRole"
+      Effect = "Allow"
+      Principal = { Service = "eks.amazonaws.com" }
+    }]
+  })
+}
+
+resource "aws_iam_role_policy_attachment" "eks_cluster_policy" {
+  policy_arn = "arn:aws:iam::aws:policy/AmazonEKSClusterPolicy"
+  role       = aws_iam_role.eks_cluster.name
+}
+
+# EKS 노드 그룹 IAM 역할
+resource "aws_iam_role" "eks_node" {
+  name = "${var.project_name}-eks-node-role"
+
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Action = "sts:AssumeRole"
+      Effect = "Allow"
+      Principal = { Service = "ec2.amazonaws.com" }
+    }]
+  })
+}
+
+resource "aws_iam_role_policy_attachment" "eks_node_policies" {
+  for_each = toset([
+    "arn:aws:iam::aws:policy/AmazonEKSWorkerNodePolicy",
+    "arn:aws:iam::aws:policy/AmazonEKS_CNI_Policy",
+    "arn:aws:iam::aws:policy/AmazonEC2ContainerRegistryReadOnly",
+  ])
+
+  policy_arn = each.value
+  role       = aws_iam_role.eks_node.name
+}
+```
+
+```hcl
+# eks.tf
+
+resource "aws_eks_cluster" "main" {
+  name     = "${var.project_name}-eks"
+  role_arn = aws_iam_role.eks_cluster.arn
+  version  = "1.29"
+
+  vpc_config {
+    subnet_ids              = aws_subnet.private[*].id
+    endpoint_private_access = true
+    endpoint_public_access  = true
+    security_group_ids      = [aws_security_group.eks_node.id]
+  }
+
+  depends_on = [
+    aws_iam_role_policy_attachment.eks_cluster_policy
+  ]
+
+  tags = { Name = "${var.project_name}-eks" }
+}
+
+resource "aws_eks_node_group" "main" {
+  cluster_name    = aws_eks_cluster.main.name
+  node_group_name = "${var.project_name}-node-group"
+  node_role_arn   = aws_iam_role.eks_node.arn
+  subnet_ids      = aws_subnet.private[*].id
+
+  instance_types = [var.eks_node_instance_type]
+
+  scaling_config {
+    desired_size = var.eks_node_desired
+    min_size     = 2
+    max_size     = 4
+  }
+
+  depends_on = [
+    aws_iam_role_policy_attachment.eks_node_policies
+  ]
+
+  tags = { Name = "${var.project_name}-node-group" }
+}
+```
+
+### 15.10 출력값
+
+```hcl
+# outputs.tf
+
+output "vpc_id" {
+  description = "VPC ID"
+  value       = aws_vpc.main.id
+}
+
+output "eks_cluster_name" {
+  description = "EKS 클러스터 이름"
+  value       = aws_eks_cluster.main.name
+}
+
+output "eks_cluster_endpoint" {
+  description = "EKS API 서버 엔드포인트"
+  value       = aws_eks_cluster.main.endpoint
+}
+
+output "ecr_repository_urls" {
+  description = "ECR 리포지토리 URL"
+  value = {
+    for k, v in aws_ecr_repository.services : k => v.repository_url
+  }
+}
+
+output "rds_endpoint" {
+  description = "RDS 엔드포인트"
+  value       = aws_db_instance.mariadb.endpoint
+}
+
+output "rds_post_init_command" {
+  description = "RDS 스키마 초기화 명령 (Terraform 완료 후 수동 실행)"
+  value       = <<-EOT
+    # 1. RDS에 접속 (Bastion 또는 kubectl exec 사용)
+    mysql -h ${aws_db_instance.mariadb.address} -u ${var.db_username} -p
+
+    # 2. 나머지 스키마 생성 + 앱 유저 권한 부여
+    CREATE DATABASE IF NOT EXISTS serve_team_db;
+    CREATE DATABASE IF NOT EXISTS serve_core_db;
+    CREATE USER IF NOT EXISTS '${var.db_app_username}'@'%' IDENTIFIED BY '<app_password>';
+    GRANT ALL PRIVILEGES ON serve_auth_db.* TO '${var.db_app_username}'@'%';
+    GRANT ALL PRIVILEGES ON serve_team_db.* TO '${var.db_app_username}'@'%';
+    GRANT ALL PRIVILEGES ON serve_core_db.* TO '${var.db_app_username}'@'%';
+    FLUSH PRIVILEGES;
+  EOT
+}
+
+output "kubeconfig_command" {
+  description = "kubeconfig 설정 명령"
+  value       = "aws eks update-kubeconfig --name ${aws_eks_cluster.main.name} --region ${var.aws_region}"
+}
+```
+
+### 15.11 배포 파이프라인 변화
+
+기존 섹션 11의 수동 Phase가 Terraform 도입으로 어떻게 바뀌는지 비교합니다.
+
+#### Phase 1: 인프라 프로비저닝 — 수동 → `terraform apply`
+
+**변경 전 (수동, 섹션 11 Phase 1):**
+```
+1.1  AWS 콘솔에서 VPC 생성
+1.2  AWS 콘솔에서 RDS 생성
+1.3  RDS 접속하여 init-db.sql 실행
+1.4  AWS 콘솔에서 ECR 리포지토리 3개 생성
+1.5  AWS 콘솔에서 EKS 클러스터 생성
+1.6  AWS Load Balancer Controller 설치
+→ 예상 소요: 수시간, 사람마다 설정 차이 가능
+```
+
+**변경 후 (Terraform):**
+```
+1.1  terraform init                         # 프로바이더 다운로드
+1.2  terraform plan                         # 생성할 리소스 미리 확인
+1.3  terraform apply                        # VPC + EKS + ECR + RDS 일괄 생성 (~15분)
+1.4  RDS 접속하여 나머지 스키마 생성          # outputs에 가이드 출력됨
+1.5  Helm으로 AWS LB Controller 설치        # Terraform 범위 밖
+→ 예상 소요: ~20분, 재현 가능
+```
+
+#### 전체 파이프라인 흐름도
+
+```
+[1회] Terraform                       [반복] GitHub Actions CI/CD
+─────────────────────────             ─────────────────────────────
+terraform apply                       Git Push (main)
+  │                                       │
+  ├── VPC (서브넷, NAT, IGW)               ▼
+  ├── EKS 클러스터 + 노드 그룹          GitHub Actions
+  ├── ECR 리포지토리 x3                    ├── Gradle Build + Test
+  ├── RDS MariaDB                         ├── Docker Build (x3)
+  ├── 보안 그룹                            ├── ECR Login + Push
+  └── IAM 역할                             ├── EKS kubeconfig
+                                           └── kubectl set image
+      │                                         │
+      ▼                                         ▼
+  [수동] Helm Install                     Rolling Update
+  └── AWS LB Controller                  (무중단 배포)
+      │
+      ▼
+  [수동] kubectl apply
+  └── K8s 매니페스트 (namespace, secrets, deployment, service, ingress)
+      │
+      ▼
+  [수동] RDS 스키마 초기화
+  └── serve_team_db, serve_core_db 생성 + 권한 부여
+```
+
+#### 요약: 누가 무엇을 관리하는가
+
+| 관리 도구 | 관리 대상 | 실행 빈도 |
+|-----------|----------|----------|
+| **Terraform** | AWS 인프라 (VPC, EKS, ECR, RDS, SG, IAM) | 인프라 변경 시에만 |
+| **kubectl / Helm** | K8s 리소스 (Deployment, Service, Ingress, LB Controller) | 초기 1회 + 구조 변경 시 |
+| **GitHub Actions** | 빌드 → ECR Push → EKS Rolling Update | 코드 Push마다 자동 |
+| **수동** | RDS 스키마 초기화 (`init-db.sql`) | 초기 1회 |
+
+### 15.12 Terraform 실행 절차
+
+```bash
+# 1. 초기화
+cd terraform/
+terraform init
+
+# 2. 변수 파일 작성
+cp terraform.tfvars.example terraform.tfvars
+# → 실제 비밀번호, JWT 시크릿 등 입력
+
+# 3. 실행 계획 확인
+terraform plan
+
+# 4. 인프라 생성 (~15분)
+terraform apply
+
+# 5. 출력값 확인
+terraform output ecr_repository_urls    # ECR 주소 → Dockerfile/CI에서 사용
+terraform output rds_endpoint           # RDS 주소 → K8s Secret에서 사용
+terraform output kubeconfig_command     # kubeconfig 설정 명령
+
+# 6. kubeconfig 설정
+aws eks update-kubeconfig --name serve-eks --region ap-northeast-2
+
+# 7. Helm으로 LB Controller 설치
+helm repo add eks https://aws.github.io/eks-charts
+helm install aws-load-balancer-controller eks/aws-load-balancer-controller \
+  -n kube-system --set clusterName=serve-eks
+
+# 8. K8s 매니페스트 배포 (섹션 3의 파일들)
+kubectl apply -f k8s-manifests/
+
+# 9. RDS 스키마 초기화
+terraform output rds_post_init_command  # 가이드 출력 → 수동 실행
+```
+
+### 15.13 인프라 삭제 (정리)
+
+```bash
+# K8s 리소스 먼저 삭제 (ALB 등 AWS 리소스 해제)
+kubectl delete -f k8s-manifests/
+
+# Terraform 리소스 전체 삭제
+terraform destroy
+```
+
+### 15.14 .gitignore 추가 항목
+
+```
+# Terraform
+terraform/.terraform/
+terraform/*.tfstate
+terraform/*.tfstate.backup
+terraform/terraform.tfvars
+terraform/.terraform.lock.hcl
+```
+
+### 15.15 Terraform 도입 시 추가 파일 목록
+
+섹션 12의 파일 목록에 추가되는 Terraform 관련 파일입니다.
+
+| 파일 | 설명 |
+|------|------|
+| `terraform/main.tf` | Provider, Backend 설정 |
+| `terraform/variables.tf` | 입력 변수 정의 |
+| `terraform/outputs.tf` | 출력값 (RDS endpoint, ECR URI 등) |
+| `terraform/terraform.tfvars` | 실제 값 (Git 커밋 금지) |
+| `terraform/vpc.tf` | VPC, 서브넷, NAT GW, IGW, 라우팅 |
+| `terraform/security-groups.tf` | ALB/EKS/RDS 보안 그룹 |
+| `terraform/ecr.tf` | ECR 리포지토리 3개 + 라이프사이클 정책 |
+| `terraform/rds.tf` | RDS MariaDB + 파라미터 그룹 |
+| `terraform/eks.tf` | EKS 클러스터 + 노드 그룹 |
+| `terraform/iam.tf` | EKS/노드/LB Controller IAM 역할 |
